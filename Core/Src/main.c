@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Self-balancing robot – STM32F103 + MPU6050 (+ auto-calib 5 s)
+  * @brief          : Main program body
   ******************************************************************************
   * @attention
   *
@@ -16,9 +16,9 @@
   ******************************************************************************
   */
 /* USER CODE END Header */
-
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "cmsis_os.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -28,6 +28,7 @@
 #include "utils.h"
 #include "stdlib.h"
 #include <stdio.h>
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -38,9 +39,9 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 /* --- PID params --- */
-#define KP      38.0f
+#define KP      55.0f
 #define KI       0.0f
-#define KD      5.0f
+#define KD      0.0f
 #define I_LIM    2.5f
 
 /* --- GPIO map --- */
@@ -52,7 +53,9 @@
 
 /* --- PWM / giới hạn --- */
 #define MAX_PWM      2700
-#define DEAD_PWM     150
+#define DEAD_PWM     150  /
+#define DEAD_FWD     150  // dead-zone cho chiều tiến
+#define DEAD_REV     200  // dead-zone cho chiều lùi
 #define FALL_ANGLE     45.0f
 
 #define TURN_DURATION_US 150000
@@ -65,30 +68,18 @@
 #define LED_CALIB_PIN   GPIO_PIN_12
 #define LED_CALIB_PORT  GPIOB
 
-#define LOOP_MIN_DT_S   0.005f
-#define LOOP_MAX_DT_S   0.004f
+#define LOOP_MIN_DT_S   0.004f
+#define LOOP_MAX_DT_S   0.005f
 
 #define ANGLE_STOP_TH   0.5f
 #define GYRO_STOP_TH    2.0f
 
-#define LEFT_MOTOR_COMP  1.05f
+#define LEFT_MOTOR_COMP  1.00f
 #define RIGHT_MOTOR_COMP 1.00f
-
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
-/* USER CODE END PM */
-
-/* Private variables ---------------------------------------------------------*/
-I2C_HandleTypeDef hi2c1;
-
-TIM_HandleTypeDef htim2;
-
-UART_HandleTypeDef huart1;
-
-/* USER CODE BEGIN PV */
 Kalman_t kal;
 volatile uint8_t  bt_rx;
 volatile char     bt_cmd = 'S';
@@ -102,8 +93,38 @@ volatile uint32_t turn_active_until = 0;
 volatile char     current_turn_direction = 'S';
 volatile char     prev_bt_cmd = 'S';
 
+volatile uint8_t motors_enabled = 1; // 1= chạy motor, 0= dừng do fall
+
 float    angle_offset_deg = 0.0f;
 uint8_t  autoCalib_done  = 0;
+uint32_t  tPrev = 0;
+uint32_t  tick_start = 0;
+float     pitchDeg_raw = 0, gyro = 0;
+float offset_sum = 0.0f;
+uint32_t offset_cnt = 0;
+static uint32_t counter = 0;
+static uint32_t last_debug = 0;
+uint32_t now =0;
+float    dt =0;
+int16_t left_pwm  = 1300;
+int16_t right_pwm = 1300;
+uint32_t hal_stick =0;
+
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
+
+TIM_HandleTypeDef htim2;
+
+UART_HandleTypeDef huart1;
+
+osThreadId convertHandle;
+osThreadId readMpuHandle;
+osThreadId setMotorHandle;
+/* USER CODE BEGIN PV */
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -112,32 +133,55 @@ static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_USART1_UART_Init(void);
+void Startconvert(void const * argument);
+void StartTaskreadMpu(void const * argument);
+void StartsetMotor(void const * argument);
+
 /* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
 void MPU6050_Init(void);
 void readMPU(float *pitchDeg, float *gyroRate, float dt);
 void stopMotor(void);
 void setIndividualMotors(int16_t left_pwm, int16_t right_pwm);
-/* USER CODE END PFP */
-
-/* USER CODE BEGIN 0 */
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-    if (huart->Instance == USART1) {
-        bt_cmd = bt_rx;
-        newCmd = 1;
-        HAL_UART_Receive_IT(&huart1, (uint8_t*)&bt_rx, 1);
-    }
-}
 /* USER CODE END 0 */
 
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
 int main(void)
 {
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
   SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_I2C1_Init();
   MX_TIM2_Init();
   MX_USART1_UART_Init();
+  /* USER CODE BEGIN 2 */
 
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
@@ -148,122 +192,61 @@ int main(void)
 
   Kalman_Init(&kal);
   MPU6050_Init();
+  tPrev = micros();
+   tick_start = HAL_GetTick();
+  /* USER CODE END 2 */
 
-  uint32_t  tPrev = micros();
-  uint32_t  tick_start = HAL_GetTick();
-  float     pitchDeg_raw = 0, gyro = 0;
-  float offset_sum = 0.0f;
-  uint32_t offset_cnt = 0;
-  static uint32_t counter = 0;
-  static uint32_t last_debug = 0;
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* definition and creation of convert */
+  osThreadDef(convert, Startconvert, osPriorityLow, 0, 128);
+  convertHandle = osThreadCreate(osThread(convert), NULL);
+
+  /* definition and creation of readMpu */
+  osThreadDef(readMpu, StartTaskreadMpu, osPriorityNormal, 0, 128);
+  readMpuHandle = osThreadCreate(osThread(readMpu), NULL);
+
+  /* definition and creation of setMotor */
+  osThreadDef(setMotor, StartsetMotor, osPriorityIdle, 0, 128);
+  setMotorHandle = osThreadCreate(osThread(setMotor), NULL);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  /* USER CODE END RTOS_THREADS */
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+
+
 
   while (1)
   {
-    uint32_t now  = micros();
-    float    dt   = (now - tPrev) * 1e-6f;
-
-    if (dt < LOOP_MIN_DT_S) continue;
-    if (dt > LOOP_MAX_DT_S) dt = LOOP_MAX_DT_S;
-    tPrev = now;
-    counter++;
-
-    if (HAL_GetTick() - last_debug >= 1000) {
-      printf("Loop/s: %lu\r\n", counter);
-      counter = 0;
-      last_debug = HAL_GetTick();
-    }
-
-    readMPU(&pitchDeg_raw, &gyro, dt);
-
-    if (!autoCalib_done && HAL_GetTick() - tick_start < AUTOCALIB_MS) {
-      HAL_GPIO_WritePin(LED_CALIB_PORT, LED_CALIB_PIN, GPIO_PIN_SET);
-      stopMotor();
-      offset_sum += pitchDeg_raw;
-      offset_cnt++;
-      continue;
-    }
-    else if (!autoCalib_done) {
-      angle_offset_deg = offset_sum / (float)offset_cnt;
-      autoCalib_done   = 1;
-      integ = 0.0f;
-      setPoint = setPointOriginal ;
-      HAL_GPIO_WritePin(LED_CALIB_PORT, LED_CALIB_PIN, GPIO_PIN_RESET);
-    }
-
-    float pitchDeg = pitchDeg_raw - angle_offset_deg;
-
-    if (fabsf(pitchDeg) > FALL_ANGLE) {
-      stopMotor();
-      integ = prevErr = prevDeriv = 0;
-      current_turn_direction = 'S';
-      setPoint = setPointOriginal;
-      prev_bt_cmd = 'S';
-      continue;
-    }
-
-    float theta = pitchDeg * DEG2RAD;
-    float omega = -gyro * DEG2RAD;
-    float err   = setPoint - theta;
-
-    float up = KP * err;
-    float ud = KD * omega;
-    integ += err * dt;
-    if (integ >  I_LIM) integ =  I_LIM;
-    if (integ < -I_LIM) integ = -I_LIM;
-    float ui = KI * integ;
-
-    float out = up + ud + ui;
-
-    int16_t pwm_raw = (int16_t)(out * 1000.0f);
-    int16_t sign    = (pwm_raw >= 0) ?  1 : -1;
-    int16_t mag     = abs(pwm_raw);
-
-    if (mag < DEAD_PWM) {
-      if (fabsf(pitchDeg) < ANGLE_STOP_TH && fabsf(gyro) < GYRO_STOP_TH) {
-        mag = 0;
-      } else {
-        mag = DEAD_PWM;
-      }
-    }
-
-    int16_t pwm = sign * mag;
-    if (pwm >  MAX_PWM) pwm =  MAX_PWM;
-    if (pwm < -MAX_PWM) pwm = -MAX_PWM;
-
-    int16_t left_pwm  = pwm;
-    int16_t right_pwm = pwm;
-
-    if (current_turn_direction != 'S' && now < turn_active_until) {
-      if (current_turn_direction == 'L') {
-        left_pwm  = pwm - TURN_PWM_OFFSET;
-        right_pwm = pwm + TURN_PWM_OFFSET;
-      } else {
-        left_pwm  = pwm + TURN_PWM_OFFSET;
-        right_pwm = pwm - TURN_PWM_OFFSET;
-      }
-    } else {
-      current_turn_direction = 'S';
-      prev_bt_cmd = 'S';
-    }
-
-    left_pwm  = (int16_t)(left_pwm * LEFT_MOTOR_COMP);
-    right_pwm = (int16_t)(right_pwm * RIGHT_MOTOR_COMP);
-
-    left_pwm  = fminf(fmaxf(left_pwm,  -MAX_PWM), MAX_PWM);
-    right_pwm = fminf(fmaxf(right_pwm, -MAX_PWM), MAX_PWM);
-
-    setIndividualMotors(left_pwm, right_pwm);
-
-    //printf("Pitch: %.2f | Gyro: %.2f | Err: %.2f | PWM: %d | L: %d | R: %d\r\n",
-      //     pitchDeg, gyro, err, pwm, left_pwm, right_pwm);
-
+    /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
   }
-
   /* USER CODE END 3 */
 }
-
 
 /**
   * @brief System Clock Configuration
@@ -453,10 +436,8 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_10|GPIO_PIN_11, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_10|GPIO_PIN_11
+                          |GPIO_PIN_12, GPIO_PIN_RESET);
 
   /*Configure GPIO pins : PB0 PB1 PB10 PB11
                            PB12 */
@@ -562,7 +543,209 @@ void setIndividualMotors(int16_t left_pwm, int16_t right_pwm)
     if (right_pwm == 0) HAL_GPIO_WritePin(DIR_PORT, DIR_R_F|DIR_R_R, GPIO_PIN_RESET);
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, right_pwm);
 }
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1) {
+        bt_cmd = bt_rx;
+        newCmd = 1;
+        HAL_UART_Receive_IT(&huart1, (uint8_t*)&bt_rx, 1);
+    }
+}
 /* USER CODE END 4 */
+
+/* USER CODE BEGIN Header_Startconvert */
+/**
+  * @brief  Function implementing the convert thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_Startconvert */
+void Startconvert(void const * argument)
+{
+  /* USER CODE BEGIN 5 */
+
+  /* Infinite loop */
+  for(;;)
+  {
+
+	   if (!autoCalib_done && HAL_GetTick() - tick_start < AUTOCALIB_MS) {
+	      HAL_GPIO_WritePin(LED_CALIB_PORT, LED_CALIB_PIN, GPIO_PIN_SET);
+	      stopMotor();
+	      offset_sum += pitchDeg_raw;
+	      offset_cnt++;
+	      osDelay(1);
+	      continue;
+	    }
+	    else if (!autoCalib_done) {
+	      angle_offset_deg = offset_sum / (float)offset_cnt;
+	      autoCalib_done   = 1;
+	      integ = 0.0f;
+	      setPoint = setPointOriginal ;
+	      HAL_GPIO_WritePin(LED_CALIB_PORT, LED_CALIB_PIN, GPIO_PIN_RESET);
+	    }
+
+	    float pitchDeg = pitchDeg_raw - angle_offset_deg;
+
+	    if (fabsf(pitchDeg) > FALL_ANGLE) {
+	      stopMotor();
+	      motors_enabled = 0; // khoá motor
+	      left_pwm = 0;
+	      right_pwm = 0; // đảm bảo task setMotor không chạy lại PWM cũ
+	      integ = prevErr = prevDeriv = 0;
+	      current_turn_direction = 'S';
+	      setPoint = setPointOriginal;
+	      prev_bt_cmd = 'S';
+	      osDelay(1);
+	      continue;
+	    }
+
+	    /* mở khoá motor khi góc trở lại an toàn (<5°) */
+	    if (!motors_enabled && fabsf(pitchDeg) < 5.0f) {
+	        motors_enabled = 1;
+	    }
+
+	    float theta = pitchDeg * DEG2RAD;
+	    float omega = -gyro * DEG2RAD;
+	    float err   = setPoint - theta;
+
+	    float up = KP * err;
+	    float ud = KD * omega;
+	    integ += err * dt;
+	    if (integ >  I_LIM) integ =  I_LIM;
+	    if (integ < -I_LIM) integ = -I_LIM;
+	    float ui = KI * integ;
+
+	    float out = up + ud + ui;
+
+	    int16_t pwm_raw = (int16_t)(out * 1000.0f);
+	    int16_t sign    = (pwm_raw >= 0) ?  1 : -1;
+	    int16_t mag     = abs(pwm_raw);
+
+	    /* Dead-zone phụ thuộc chiều: tiến = 150, lùi = 200 */
+	    int16_t dead_th = (sign > 0) ? DEAD_FWD : DEAD_REV;
+
+	    if (mag < dead_th) {
+	      if (fabsf(pitchDeg) < ANGLE_STOP_TH && fabsf(gyro) < GYRO_STOP_TH) {
+	        mag = 0;
+	      } else {
+	        mag = dead_th;
+	      }
+	    }
+
+	    int16_t pwm = sign * mag;
+	    if (pwm >  MAX_PWM) pwm =  MAX_PWM;
+	    if (pwm < -MAX_PWM) pwm = -MAX_PWM;
+
+	     left_pwm  = pwm;
+	     right_pwm = pwm;
+
+	    if (current_turn_direction != 'S' && now < turn_active_until) {
+	      if (current_turn_direction == 'L') {
+	        left_pwm  = pwm - TURN_PWM_OFFSET;
+	        right_pwm = pwm + TURN_PWM_OFFSET;
+	      } else {
+	        left_pwm  = pwm + TURN_PWM_OFFSET;
+	        right_pwm = pwm - TURN_PWM_OFFSET;
+	      }
+	    } else {
+	      current_turn_direction = 'S';
+	      prev_bt_cmd = 'S';
+	    }
+
+	    left_pwm  = (int16_t)(left_pwm * LEFT_MOTOR_COMP);
+	    right_pwm = (int16_t)(right_pwm * RIGHT_MOTOR_COMP);
+
+	    left_pwm  = fminf(fmaxf(left_pwm,  -MAX_PWM), MAX_PWM);
+	    right_pwm = fminf(fmaxf(right_pwm, -MAX_PWM), MAX_PWM);
+
+    osDelay(1);
+  }
+  /* USER CODE END 5 */
+}
+
+/* USER CODE BEGIN Header_StartTaskreadMpu */
+/**
+* @brief Function implementing the readMpu thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartTaskreadMpu */
+void StartTaskreadMpu(void const * argument)
+{
+  /* USER CODE BEGIN StartTaskreadMpu */
+  /* Infinite loop */
+  for(;;)
+  {
+	        now  = micros();
+	        dt   = (now - tPrev) * 1e-6f;
+
+	    if (dt < LOOP_MIN_DT_S) continue;
+	    if (dt > LOOP_MAX_DT_S) dt = LOOP_MAX_DT_S;
+	    tPrev = now;
+	    counter++;
+
+	    if (HAL_GetTick() - last_debug >= 1000) {
+	    //  printf("Loop/s: %lu\r\n", counter);
+	      counter = 0;
+	      last_debug = HAL_GetTick();
+	    }
+
+        uint32_t term = HAL_GetTick();
+	    readMPU(&pitchDeg_raw, &gyro, dt);
+	    hal_stick = HAL_GetTick() - term;
+    osDelay(1);
+  }
+  /* USER CODE END StartTaskreadMpu */
+}
+
+/* USER CODE BEGIN Header_StartsetMotor */
+/**
+* @brief Function implementing the setMotor thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartsetMotor */
+void StartsetMotor(void const * argument)
+{
+  /* USER CODE BEGIN StartsetMotor */
+  /* Infinite loop */
+  for(;;)
+  {
+
+
+		  if (motors_enabled) {
+		      setIndividualMotors(left_pwm, right_pwm);
+		  } else {
+		      setIndividualMotors(0, 0);
+		  }
+
+
+    osDelay(1);
+  }
+  /* USER CODE END StartsetMotor */
+}
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM1 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM1)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.
@@ -595,3 +778,7 @@ void assert_failed(uint8_t *file, uint32_t line)
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
+Beta
+0 / 0
+used queries
+1
