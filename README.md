@@ -25,7 +25,7 @@
 | 4   | Kiểm tra giao tiếp của HC-05                                          | Dai            | 2025-06-03 | Done   | 100%       |
 | 5   | Kiểm tra mạch PCB và các dây nối                                      | Tien, Dat      | 2025-06-03 | Done   | 100%       |
 | 6   | Hoàn thiện khung xe và các phần cứng                                  | Tai, Huy       | 2025-06-05 | Done   | 95%        |
-| 7   | Code chính                                                            | Dai            |       | Done   | —          |
+| 7   | Code chính                                                            | Dai            |       | Done   | 100%         |
 | 8   | Nội dung mục tiêu và kết quả cần khi thực hiện                        | Huy            | 2025-06-11 | Done   | 100%       |
 | 9   | Soạn nội dung về các linh kiện sử dụng                                | Tien, Dat      | 2025-06-11 | Done    | 100%       |
 
